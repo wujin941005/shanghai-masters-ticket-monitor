@@ -1,0 +1,10 @@
+[project]
+name = "shanghai-masters-ticket-monitor"
+version = "0.1.0"
+description = "2026 上海劳力士大师赛多渠道回流票监控机器人"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "curl-cffi>=0.14.0",
+    "requests>=2.32.5",
+]

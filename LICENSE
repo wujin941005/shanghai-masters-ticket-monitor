@@ -1,0 +1,96 @@
+Shanghai Masters Ticket Monitor Non-Commercial License 1.0
+
+Copyright (c) 2026 wujin941005
+
+1. Definitions
+
+"Software" means this software and its associated source code,
+documentation, configuration examples, and other files.
+
+"Non-Commercial Purpose" means use that is not primarily intended for or
+directed toward commercial advantage, monetary compensation, or other
+financial benefit, whether direct or indirect.
+
+"Commercial Purpose" means any purpose that does not qualify as a
+Non-Commercial Purpose.
+
+2. Non-Commercial Grant
+
+Subject to the terms of this License, each copyright holder grants you a
+worldwide, royalty-free, non-exclusive, non-transferable license to view,
+use, copy, modify, and distribute the Software solely for personal,
+educational, academic, research, charitable, or other Non-Commercial
+Purposes.
+
+3. Conditions
+
+Any copy or substantial portion of the Software, including a modified
+version, must retain this copyright notice, this License, and a clear notice
+of any material modifications. You may not remove or obscure notices of
+authorship, copyright, or licensing.
+
+4. Commercial Use Prohibited
+
+Without separate prior written permission from the applicable copyright
+holders, you may not use the Software, in whole or in part, for any Commercial
+Purpose. Prohibited uses include, without limitation:
+
+(a) selling, renting, licensing, sublicensing, or otherwise charging for the
+    Software or access to it;
+(b) providing paid deployment, hosting, monitoring, notification,
+    ticket-watching, ticket-purchasing, ticket-reservation, or similar
+    services using the Software;
+(c) using the Software to support any paid service, subscription, membership,
+    consultancy, resale operation, or other revenue-generating activity;
+(d) incorporating the Software or a modified version into a commercial
+    product or service; and
+(e) using the Software primarily to obtain commercial advantage or financial
+    compensation for yourself or any third party.
+
+Advertising, sponsorship, donations tied to access or benefits, and any other
+form of direct or indirect compensation are considered commercial use when
+connected to use of the Software.
+
+5. Commercial Licensing
+
+Commercial rights are not granted under this License. To obtain commercial
+rights, you must receive a separate written license from the applicable
+copyright holders. No contributor is required to offer a commercial license.
+The copyright holders may use the Software themselves and may offer separate
+licenses for the Software under different terms. Each copyright holder retains
+all rights, including commercial rights, in their own contribution.
+
+6. No Trademark Rights
+
+This License does not grant permission to use any trade name, trademark,
+service mark, or product identity of the copyright holders or contributors,
+except as reasonably necessary to describe the origin of the Software and
+reproduce required notices.
+
+7. Termination
+
+Your rights under this License terminate automatically if you violate any of
+its terms. If you stop the violation and remedy its effects within 30 days of
+receiving notice, your rights are reinstated automatically for that first
+violation. Any later violation terminates your rights permanently unless the
+applicable copyright holders expressly reinstate them in writing.
+
+8. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. YOU BEAR ALL
+RISKS ARISING FROM USE OF THE SOFTWARE.
+
+9. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, IN NO EVENT SHALL ANY COPYRIGHT HOLDER
+OR CONTRIBUTOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER DEALINGS IN THE SOFTWARE.
+
+10. Source-Available Notice
+
+This is a source-available, non-commercial license. It is not an Open Source
+license as defined by the Open Source Initiative, because it restricts fields
+of use.

@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments and test artifacts
+.venv/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime and secrets
+.env
+monitor.log
+monitor.log.*
+monitor-state.json
+monitor-state.*.json
+*.sqlite3*
+
+# Local commercial overlay
+.private/
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
