@@ -16,9 +16,11 @@ from monitor import (
     RateLimitError,
     RuntimeOptions,
     STOP_REQUESTED,
+    StreamingPriceResultProcessor,
     TARGETS,
     TargetResult,
     build_http_client,
+    build_other_channel_context,
     build_juss_web_url,
     build_parser,
     build_piaoxingqiu_alipay_url,
@@ -49,6 +51,8 @@ from monitor import (
     request_stop,
     select_targets,
     save_monitor_state,
+    select_other_channel_context_sessions,
+    session_comparison_key,
     session_catalog_refresh_due,
     session_scope_is_allowed,
     update_session_cache,
@@ -128,6 +132,27 @@ class HttpClientTests(unittest.TestCase):
             client.get_json("https://example.test", headers={}, params={})
 
         self.assertEqual(context.exception.status_code, 403)
+        self.assertIsNone(context.exception.retry_after_seconds)
+
+    def test_http_469_is_treated_as_piaoxingqiu_rate_limit(self):
+        class Response:
+            status_code = 469
+            headers = {}
+
+            def json(self):
+                return {"message": "risk control"}
+
+        class Session:
+            def get(self, *_args, **_kwargs):
+                return Response()
+
+        client = HttpClient()
+        client.session = Session()
+
+        with self.assertRaises(RateLimitError) as context:
+            client.get_json("https://example.test", headers={}, params={})
+
+        self.assertEqual(context.exception.status_code, 469)
         self.assertIsNone(context.exception.retry_after_seconds)
 
     def test_success_http_with_rate_limit_payload_is_detected(self):
@@ -246,6 +271,31 @@ class RefreshSchedulingTests(unittest.TestCase):
         self.assertEqual(
             [result.session.target.channel for result in results],
             ["piaoxingqiu"],
+        )
+
+    def test_price_result_callback_runs_before_next_sequential_request(self):
+        sessions = [
+            InventoryItem(TARGETS[0], "j1", "久事1", "ON_SALE"),
+            InventoryItem(TARGETS[0], "j2", "久事2", "ON_SALE"),
+        ]
+        timeline = []
+
+        def check(_client, session):
+            timeline.append(f"query:{session.session_id}")
+            return PriceLevelResult(session, [])
+
+        with patch("monitor.check_price_level", side_effect=check):
+            check_all_price_levels(
+                object(),
+                sessions,
+                result_callback=lambda result: timeline.append(
+                    f"callback:{result.session.session_id}"
+                ),
+            )
+
+        self.assertEqual(
+            timeline,
+            ["query:j1", "callback:j1", "query:j2", "callback:j2"],
         )
 
 
@@ -491,6 +541,45 @@ class NotificationGuardTests(unittest.TestCase):
             "半决赛 · B ¥960 · 最多可选 4 张",
         )
 
+    def test_stream_processor_notifies_and_commits_before_batch_end(self):
+        timeline = []
+
+        class Dispatcher:
+            configured = True
+
+            def send(self, event):
+                timeline.append(event)
+                return {"test": True}
+
+        state = MonitorState.empty()
+        previous = {self.level.key: False}
+        streaks = {self.level.key: -1}
+        baselined = {self.level.session.key}
+        processor = StreamingPriceResultProcessor(
+            client=object(),
+            dispatcher=Dispatcher(),
+            state=state,
+            runtime=RuntimeOptions(notification_cooldown=0),
+            catalog_items=[self.level.session],
+            previous_price_levels=previous,
+            price_level_streaks=streaks,
+            baselined_price_sessions=baselined,
+            last_notified_at={},
+            notification_retries={},
+            round_rate_limits=[],
+            round_started=0,
+            request_gap_seconds=0,
+            grades=None,
+            dry_run=False,
+        )
+
+        processor.handle(PriceLevelResult(self.level.session, [self.level]))
+
+        self.assertEqual(len(timeline), 1)
+        self.assertTrue(previous[self.level.key])
+        self.assertEqual(state.alert_count, 1)
+        self.assertEqual(processor.pending_notification_keys, set())
+
     def test_notification_acknowledges_only_successful_ticket_platform_group(self):
         other_session = InventoryItem(TARGETS[5], "s2", "决赛", "ON_SALE")
         other_level = PriceLevelItem(other_session, "p2", "A", 1280, 2)
@@ -534,6 +623,79 @@ class NotificationGuardTests(unittest.TestCase):
             {event.url for event in dispatcher.events},
             {TARGETS[5].buy_url, TARGETS[6].buy_url},
         )
+
+    def test_notification_mentions_existing_stock_on_other_channel(self):
+        juss_session = InventoryItem(
+            TARGETS[0], "juss-night", "中央馆10月10日周六夜场", "ON_SALE"
+        )
+        pxq_session = InventoryItem(
+            TARGETS[5], "pxq-night", "中央馆10月10日周六夜场", "ON_SALE"
+        )
+        juss_restock = PriceLevelItem(juss_session, "juss-b", "B", 280, 2)
+        pxq_existing = PriceLevelItem(pxq_session, "pxq-a", "A", 340, 4)
+
+        context = build_other_channel_context(
+            [juss_restock],
+            [
+                PriceLevelResult(juss_session, [juss_restock]),
+                PriceLevelResult(pxq_session, [pxq_existing]),
+            ],
+            [juss_session, pxq_session],
+        )
+
+        class Dispatcher:
+            def __init__(self):
+                self.events = []
+
+            def send(self, event):
+                self.events.append(event)
+                return {"test": True}
+
+        dispatcher = Dispatcher()
+        notify_price_levels_available(
+            dispatcher,
+            [juss_restock],
+            other_channel_context=context,
+        )
+
+        self.assertIn(
+            "📌 其他入口：中央馆10月10日周六夜场 · "
+            "票星球同场次当前已有票：A ¥340",
+            dispatcher.events[0].body,
+        )
+
+    def test_cross_channel_identity_does_not_mix_day_and_night_sessions(self):
+        day = InventoryItem(
+            TARGETS[0], "day", "中央馆10月10日周六日场", "ON_SALE"
+        )
+        night = InventoryItem(
+            TARGETS[5], "night", "中央馆10月10日周六夜场", "ON_SALE"
+        )
+
+        self.assertNotEqual(
+            session_comparison_key(day),
+            session_comparison_key(night),
+        )
+
+    def test_missing_other_channel_is_selected_for_one_off_price_lookup(self):
+        juss_session = InventoryItem(
+            TARGETS[0], "juss-night", "中央馆10月10日周六夜场", "ON_SALE"
+        )
+        pxq_session = InventoryItem(
+            TARGETS[5], "pxq-night", "中央馆10月10日周六夜场", "ON_SALE"
+        )
+        wrong_daypart = InventoryItem(
+            TARGETS[5], "pxq-day", "中央馆10月10日周六日场", "ON_SALE"
+        )
+        restock = PriceLevelItem(juss_session, "juss-b", "B", 280, 2)
+
+        selected = select_other_channel_context_sessions(
+            [restock],
+            [PriceLevelResult(juss_session, [restock])],
+            [juss_session, pxq_session, wrong_daypart],
+        )
+
+        self.assertEqual(selected, [pxq_session])
 
 
 class ParseSessionsTests(unittest.TestCase):

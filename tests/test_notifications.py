@@ -1,4 +1,5 @@
 import unittest
+import threading
 from dataclasses import dataclass
 from unittest.mock import patch
 
@@ -109,6 +110,30 @@ class PublicDispatcherTests(unittest.TestCase):
         results = dispatcher.send(NotificationEvent("title", "body"))
 
         self.assertEqual(results, {"failed": False, "working": True})
+
+    def test_configured_notifiers_send_concurrently(self):
+        barrier = threading.Barrier(2)
+
+        @dataclass
+        class StubNotifier:
+            channel: str
+            name: str
+
+            def send(self, _event):
+                barrier.wait(timeout=1)
+                return True
+
+        dispatcher = NotificationDispatcher(
+            (
+                StubNotifier("first", "渠道一"),
+                StubNotifier("second", "渠道二"),
+            )
+        )
+
+        self.assertEqual(
+            dispatcher.send(NotificationEvent("title", "body")),
+            {"first": True, "second": True},
+        )
 
 
 class BarkSendTests(unittest.TestCase):

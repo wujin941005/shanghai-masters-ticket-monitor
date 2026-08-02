@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 from urllib.parse import quote
@@ -220,15 +222,46 @@ class NotificationDispatcher:
         return "/".join(notifier.name for notifier in self.notifiers) or "未配置"
 
     def send(self, event: NotificationEvent) -> dict[str, bool]:
-        results: dict[str, bool] = {}
-        for notifier in self.notifiers:
+        if not self.notifiers:
+            return {}
+
+        def send_one(notifier: Notifier) -> tuple[bool, float]:
+            started = time.monotonic()
             try:
-                results[notifier.channel] = notifier.send(event)
+                return notifier.send(event), time.monotonic() - started
             except Exception as exc:
                 # requests exceptions may contain secret URLs, so log only the type.
                 log.warning("⚠️ %s 推送失败: %s", notifier.name, type(exc).__name__)
-                results[notifier.channel] = False
-        return results
+                return False, time.monotonic() - started
+
+        started = time.monotonic()
+        completed: dict[str, tuple[bool, float]] = {}
+        with ThreadPoolExecutor(
+            max_workers=len(self.notifiers),
+            thread_name_prefix="masters-notify",
+        ) as executor:
+            futures = {
+                executor.submit(send_one, notifier): notifier
+                for notifier in self.notifiers
+            }
+            for future in as_completed(futures):
+                notifier = futures[future]
+                completed[notifier.channel] = future.result()
+
+        if len(self.notifiers) > 1:
+            timings = "、".join(
+                f"{notifier.name} {completed[notifier.channel][1]:.2f}s"
+                for notifier in self.notifiers
+            )
+            log.info(
+                "⚡ 通知通道并发完成 %.2fs（%s）",
+                time.monotonic() - started,
+                timings,
+            )
+        return {
+            notifier.channel: completed[notifier.channel][0]
+            for notifier in self.notifiers
+        }
 
 
 def parse_notification_channels(

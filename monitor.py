@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import sys
 import threading
@@ -19,7 +20,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Iterable, Mapping, TypeVar
+from typing import Any, Callable, Iterable, Mapping, TypeVar
 from urllib.parse import quote, urlencode
 
 from curl_cffi import CurlOpt
@@ -619,7 +620,8 @@ RATE_LIMIT_HINTS = (
     "限流",
     "人数过多",
 )
-RATE_LIMIT_HTTP_STATUSES = {403, 429}
+# 久事常见 403，票星球实测会用非标准 469 表示风控拦截。
+RATE_LIMIT_HTTP_STATUSES = {403, 429, 469}
 
 
 def parse_retry_after(value: str | None) -> float | None:
@@ -694,7 +696,7 @@ class HttpClient:
         response = session.get(url, headers=headers, params=params, timeout=timeout)
         status_code = int(response.status_code)
         retry_after = parse_retry_after(response.headers.get("Retry-After"))
-        # 久事的公开接口在高频触发风控时返回 403，而不是标准的 429。
+        # 两个平台都可能用非标准状态码表达风控，而不是标准的 429。
         # 两者都必须进入同渠道短路和退避，避免把临时风控打成持续封禁。
         if status_code in RATE_LIMIT_HTTP_STATUSES:
             raise RateLimitError(
@@ -896,6 +898,7 @@ def check_all_price_levels(
     *,
     request_gap_seconds: float = 0,
     blocked_channels: Iterable[str] = (),
+    result_callback: Callable[[PriceLevelResult], None] | None = None,
 ) -> list[PriceLevelResult]:
     results: list[PriceLevelResult] = []
     rate_limited_channels = set(blocked_channels)
@@ -911,6 +914,8 @@ def check_all_price_levels(
         result = check_price_level(client, session)
         request_count += 1
         results.append(result)
+        if result_callback is not None:
+            result_callback(result)
         if result.rate_limited:
             rate_limited_channels.add(session.target.channel)
     return results
@@ -1280,6 +1285,50 @@ def compact_session_name(name: str) -> str:
     return name.strip()
 
 
+def session_comparison_key(session: InventoryItem) -> str:
+    """Build a conservative cross-channel identity for the same playing session."""
+    compact = re.sub(r"\s+", "", compact_session_name(session.session_name)).casefold()
+    date_match = re.search(r"\d{1,2}月\d{1,2}日", compact)
+    if date_match is None:
+        return f"{session.target.show_label.casefold()}|{compact}"
+
+    show_label = session.target.show_label.casefold()
+    venue = next(
+        (
+            value
+            for marker, value in (
+                ("中央", "center"),
+                ("2号", "court-2"),
+                ("资格赛", "qualifying"),
+                ("嘉年华", "fan-week"),
+            )
+            if marker.casefold() in show_label
+        ),
+        show_label,
+    )
+    stage = next(
+        (
+            marker
+            for marker in (
+                "四分之一决赛",
+                "半决赛",
+                "资格赛",
+                "决赛",
+                "第三轮",
+                "第二轮",
+                "第一轮",
+            )
+            if marker in compact
+        ),
+        "",
+    )
+    daypart = next(
+        (marker for marker in ("日场", "夜场", "上午", "下午", "晚场") if marker in compact),
+        "",
+    )
+    return "|".join((venue, date_match.group(0), stage, daypart))
+
+
 def format_price(price: float | None) -> str:
     if price is None:
         return "价格未知"
@@ -1287,6 +1336,114 @@ def format_price(price: float | None) -> str:
     if numeric_price.is_integer():
         return f"¥{numeric_price:,.0f}"
     return f"¥{numeric_price:,.2f}".rstrip("0").rstrip(".")
+
+
+def build_other_channel_context(
+    trigger_items: Iterable[PriceLevelItem],
+    price_results: Iterable[PriceLevelResult],
+    catalog_items: Iterable[InventoryItem],
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Describe other channels that currently sell the same playing session."""
+    triggers = list(trigger_items)
+    results = list(price_results)
+    catalogs = list(catalog_items)
+    source_pairs = {
+        (item.target.channel, session_comparison_key(item.session))
+        for item in triggers
+    }
+    newly_available_pairs = set(source_pairs)
+
+    labels: dict[str, str] = {}
+    observed_pairs: set[tuple[str, str]] = set()
+    available_levels: dict[tuple[str, str], list[PriceLevelItem]] = defaultdict(list)
+    for result in results:
+        channel = result.session.target.channel
+        labels[channel] = result.session.target.channel_label
+        pair = (channel, session_comparison_key(result.session))
+        if result.error is not None:
+            continue
+        observed_pairs.add(pair)
+        available_levels[pair].extend(item for item in result.items if item.available)
+
+    catalog_available_pairs: set[tuple[str, str]] = set()
+    for item in catalogs:
+        labels[item.target.channel] = item.target.channel_label
+        if item.status in AVAILABLE_STATUSES:
+            catalog_available_pairs.add(
+                (item.target.channel, session_comparison_key(item))
+            )
+
+    contexts: dict[tuple[str, str], tuple[str, ...]] = {}
+    for source_channel, session_key in source_pairs:
+        messages: list[str] = []
+        other_channels = sorted(
+            channel for channel in labels if channel != source_channel
+        )
+        for other_channel in other_channels:
+            pair = (other_channel, session_key)
+            label = labels[other_channel]
+            if pair in observed_pairs:
+                levels = available_levels.get(pair, [])
+                if not levels:
+                    continue
+                grade_labels = list(
+                    dict.fromkeys(
+                        f"{item.seat_plan_name} {format_price(item.original_price)}"
+                        for item in levels
+                    )
+                )
+                grade_summary = "、".join(grade_labels[:4])
+                if len(grade_labels) > 4:
+                    grade_summary += f"等 {len(grade_labels)} 个票档"
+                status_text = (
+                    "本轮也检测到回流"
+                    if pair in newly_available_pairs
+                    else "当前已有票"
+                )
+                messages.append(f"{label}同场次{status_text}：{grade_summary}")
+            elif pair in catalog_available_pairs:
+                messages.append(
+                    f"{label}同场次最近一次目录状态为有票（具体票档未确认）"
+                )
+        if messages:
+            contexts[(source_channel, session_key)] = tuple(messages)
+    return contexts
+
+
+def select_other_channel_context_sessions(
+    trigger_items: Iterable[PriceLevelItem],
+    price_results: Iterable[PriceLevelResult],
+    catalog_items: Iterable[InventoryItem],
+) -> list[InventoryItem]:
+    """Select missing same-session channels for a one-off notification lookup."""
+    source_pairs = {
+        (item.target.channel, session_comparison_key(item.session))
+        for item in trigger_items
+    }
+    observed_pairs = {
+        (result.session.target.channel, session_comparison_key(result.session))
+        for result in price_results
+    }
+    selected: list[InventoryItem] = []
+    selected_keys: set[str] = set()
+    for candidate in catalog_items:
+        if candidate.status not in AVAILABLE_STATUSES:
+            continue
+        candidate_pair = (
+            candidate.target.channel,
+            session_comparison_key(candidate),
+        )
+        if candidate_pair in observed_pairs or candidate.key in selected_keys:
+            continue
+        if not any(
+            source_channel != candidate.target.channel
+            and source_session_key == candidate_pair[1]
+            for source_channel, source_session_key in source_pairs
+        ):
+            continue
+        selected.append(candidate)
+        selected_keys.add(candidate.key)
+    return selected
 
 
 def display_results(
@@ -1471,6 +1628,8 @@ def notify_available(
 def notify_price_levels_available(
     dispatcher: NotificationDispatcher,
     items: Iterable[PriceLevelItem],
+    *,
+    other_channel_context: Mapping[tuple[str, str], tuple[str, ...]] | None = None,
 ) -> set[str]:
     grouped: dict[tuple[str, str], list[PriceLevelItem]] = defaultdict(list)
     for item in items:
@@ -1490,6 +1649,17 @@ def notify_price_levels_available(
         ]
         if len(channel_items) > 8:
             lines.append(f"…另有 {len(channel_items) - 8} 个可购票档")
+        context_lines: list[str] = []
+        for item in channel_items:
+            key = (item.target.channel, session_comparison_key(item.session))
+            for message in (other_channel_context or {}).get(key, ()):
+                session_message = (
+                    f"{compact_session_name(item.session.session_name)} · {message}"
+                )
+                if session_message not in context_lines:
+                    context_lines.append(session_message)
+        if context_lines:
+            lines.extend(("", *(f"📌 其他入口：{line}" for line in context_lines)))
         lines.extend(
             (
                 "",
@@ -1516,6 +1686,230 @@ def notify_price_levels_available(
         if any(results.values()):
             delivered_keys.update(item.key for item in channel_items)
     return delivered_keys
+
+
+class StreamingPriceResultProcessor:
+    """Process and notify each completed price query before the batch ends."""
+
+    def __init__(
+        self,
+        *,
+        client: HttpClient,
+        dispatcher: NotificationDispatcher,
+        state: MonitorState,
+        runtime: RuntimeOptions,
+        catalog_items: Iterable[InventoryItem],
+        previous_price_levels: dict[str, bool],
+        price_level_streaks: dict[str, int],
+        baselined_price_sessions: set[str],
+        last_notified_at: dict[str, float],
+        notification_retries: dict[str, NotificationRetry],
+        round_rate_limits: list[TargetResult | PriceLevelResult],
+        round_started: float,
+        request_gap_seconds: float,
+        grades: str | None,
+        dry_run: bool,
+    ) -> None:
+        self.client = client
+        self.dispatcher = dispatcher
+        self.state = state
+        self.runtime = runtime
+        self.catalog_items = list(catalog_items)
+        self.previous_price_levels = previous_price_levels
+        self.price_level_streaks = price_level_streaks
+        self.baselined_price_sessions = baselined_price_sessions
+        self.last_notified_at = last_notified_at
+        self.notification_retries = notification_retries
+        self.round_rate_limits = round_rate_limits
+        self.round_started = round_started
+        self.request_gap_seconds = request_gap_seconds
+        self.grades = grades
+        self.dry_run = dry_run
+        self.observed_results: list[PriceLevelResult] = []
+        self.processed_session_keys: set[str] = set()
+        self.pending_notification_keys: set[str] = set()
+        self.pending_confirmation = 0
+
+    def handle(self, raw_result: PriceLevelResult) -> None:
+        """Run on the monitor thread as soon as one worker result completes."""
+        result = filter_price_level_results([raw_result], self.grades)[0]
+        session_key = result.session.key
+        if session_key in self.processed_session_keys:
+            return
+        self.processed_session_keys.add(session_key)
+        self.observed_results.append(result)
+        if result.rate_limited:
+            self.round_rate_limits.append(result)
+
+        update_price_level_streaks(
+            self.price_level_streaks,
+            [result],
+            confirmations=self.runtime.availability_confirmations,
+            baselined_sessions=self.baselined_price_sessions,
+        )
+        if result.error is not None:
+            return
+
+        initial_session_round = session_key not in self.baselined_price_sessions
+        confirmed_items = confirmed_available_price_levels(
+            result.items,
+            self.price_level_streaks,
+            confirmations=self.runtime.availability_confirmations,
+        )
+        newly_available = find_newly_available_price_levels(
+            self.previous_price_levels,
+            confirmed_items,
+            initial_round=initial_session_round,
+            notify_initial=self.runtime.notify_initial,
+        )
+        if not initial_session_round:
+            self.pending_confirmation += sum(
+                item.available
+                and self.previous_price_levels.get(item.key) is not True
+                and 0
+                < self.price_level_streaks.get(item.key, 0)
+                < self.runtime.availability_confirmations
+                for item in result.items
+            )
+
+        result_received_at = time.monotonic()
+        now = time.time()
+        eligible = filter_notification_cooldown(
+            newly_available,
+            self.last_notified_at,
+            now=now,
+            cooldown=self.runtime.notification_cooldown,
+        )
+        suppressed = len(newly_available) - len(eligible)
+        if suppressed:
+            log.info("🔕 %d 个票档仍在通知冷却期，已抑制重复提醒", suppressed)
+
+        result_pending_keys: set[str] = set()
+        if eligible:
+            result_pending_keys = self._notify(
+                eligible,
+                now=now,
+                result_received_at=result_received_at,
+            )
+        update_confirmed_price_level_state(
+            self.previous_price_levels,
+            [result],
+            self.price_level_streaks,
+            confirmations=self.runtime.availability_confirmations,
+            preserve_available_keys=result_pending_keys,
+        )
+        self.baselined_price_sessions.add(session_key)
+
+    def _notify(
+        self,
+        eligible: list[PriceLevelItem],
+        *,
+        now: float,
+        result_received_at: float,
+    ) -> set[str]:
+        log.info("🎉 连续确认 %d 个可购票档", len(eligible))
+        for item in eligible:
+            log.info(
+                "   ↳ %s · %s · %s · %s · 当前最多可选 %d 张",
+                item.target.channel_label,
+                compact_session_name(item.session.session_name),
+                item.seat_plan_name,
+                format_price(item.original_price),
+                item.can_buy_count,
+            )
+
+        delivered_keys: set[str] = set()
+        if self.dry_run:
+            log.info(
+                "🧪 静默演练：本轮原本会发送 %d 个票档的合并通知",
+                len(eligible),
+            )
+            delivered_keys = {item.key for item in eligible}
+        elif self.dispatcher.configured:
+            context_price_results = list(self.observed_results)
+            context_sessions = select_other_channel_context_sessions(
+                eligible,
+                self.observed_results,
+                self.catalog_items,
+            )
+            if context_sessions:
+                log.info(
+                    "🔗 为回流通知补查 %d 个同场次其他平台入口",
+                    len(context_sessions),
+                )
+                blocked_channels = {
+                    (
+                        result.target.channel
+                        if isinstance(result, TargetResult)
+                        else result.session.target.channel
+                    )
+                    for result in self.round_rate_limits
+                }
+                extra_context_results = filter_price_level_results(
+                    check_all_price_levels(
+                        self.client,
+                        context_sessions,
+                        request_gap_seconds=self.request_gap_seconds,
+                        blocked_channels=blocked_channels,
+                    ),
+                    self.grades,
+                )
+                self.round_rate_limits.extend(
+                    result
+                    for result in extra_context_results
+                    if result.rate_limited
+                )
+                context_price_results.extend(extra_context_results)
+            other_channel_context = build_other_channel_context(
+                eligible,
+                context_price_results,
+                self.catalog_items,
+            )
+            delivered_keys = notify_price_levels_available(
+                self.dispatcher,
+                eligible,
+                other_channel_context=other_channel_context,
+            )
+        else:
+            log.warning("未配置通知渠道，未发送推送")
+
+        delivered_items = [
+            item for item in eligible if item.key in delivered_keys
+        ]
+        if delivered_items:
+            mark_notified(delivered_items, self.last_notified_at, now=now)
+            self.state.alert_count += len(delivered_items)
+            log.info(
+                "⚡ 结果到达后 %.2fs 完成推送（本轮开始后 %.2fs）",
+                time.monotonic() - result_received_at,
+                time.monotonic() - self.round_started,
+            )
+
+        pending_keys, exhausted_keys = record_notification_outcome(
+            eligible,
+            delivered_keys,
+            self.notification_retries,
+            max_attempts=self.runtime.notification_max_retries,
+        )
+        self.pending_notification_keys.update(pending_keys)
+        if pending_keys:
+            highest_attempt = max(
+                self.notification_retries[key].attempts for key in pending_keys
+            )
+            log.warning(
+                "⚠️ %d 个票档推送全部失败，保留回流事件下轮重试（%d/%d）",
+                len(pending_keys),
+                highest_attempt,
+                self.runtime.notification_max_retries,
+            )
+        if exhausted_keys:
+            log.warning(
+                "🛑 %d 个票档推送已连续失败 %d 次；停止本次事件重试，"
+                "待其售罄后再次回流会重新提醒",
+                len(exhausted_keys),
+                self.runtime.notification_max_retries,
+            )
+        return pending_keys
 
 
 def notify_error(dispatcher: NotificationDispatcher, error_count: int) -> None:
@@ -1639,6 +2033,8 @@ def main(
     runtime: RuntimeOptions | None = None,
     dispatcher_builder: Any = build_dispatcher,
     client_builder: Any = build_http_client,
+    target_checker: Any = check_all,
+    price_checker: Any = check_all_price_levels,
     item_scope_filter: Any = None,
     item_scope_label: str = "监控范围",
 ) -> int:
@@ -1775,7 +2171,7 @@ def main(
 
     if args.list_sessions or args.list_price_levels:
         log.info("正在查询 %d 个票务活动的公开场次…", len(targets))
-        results = check_all(
+        results = target_checker(
             client,
             targets,
             request_gap_seconds=request_gap_seconds,
@@ -1800,7 +2196,7 @@ def main(
             return 2
         log.info("正在查询 %d 个所选场次的公开票档…", len(sessions))
         price_results = filter_price_level_results(
-            check_all_price_levels(
+            price_checker(
                 client,
                 sessions,
                 request_gap_seconds=request_gap_seconds,
@@ -1897,7 +2293,7 @@ def main(
             )
             fresh_results: list[TargetResult] = []
             if refresh_sessions:
-                fresh_results = check_all(
+                fresh_results = target_checker(
                     client,
                     targets,
                     request_gap_seconds=request_gap_seconds,
@@ -1935,18 +2331,20 @@ def main(
             else:
                 results = cached_target_results(session_cache, targets)
 
-            current_items = display_results(
+            catalog_items = display_results(
                 results,
                 count,
                 0 if args.once else current_interval,
                 match=args.match,
                 verbose=args.verbose,
             )
+            current_items = catalog_items
             if item_scope_filter is not None:
                 catalog_item_count = len(current_items)
                 current_items = item_scope_filter(
                     current_items,
                     previous,
+                    price_level_availability=previous_price_levels,
                     active_notification_keys=notification_retries,
                 )
                 if refresh_sessions:
@@ -1981,149 +2379,58 @@ def main(
                     for result in round_rate_limits
                     if isinstance(result, TargetResult)
                 }
+                stream_processor = StreamingPriceResultProcessor(
+                    client=client,
+                    dispatcher=dispatcher,
+                    state=state,
+                    runtime=runtime,
+                    catalog_items=catalog_items,
+                    previous_price_levels=previous_price_levels,
+                    price_level_streaks=price_level_streaks,
+                    baselined_price_sessions=baselined_price_sessions,
+                    last_notified_at=last_notified_at,
+                    notification_retries=notification_retries,
+                    round_rate_limits=round_rate_limits,
+                    round_started=round_started,
+                    request_gap_seconds=request_gap_seconds,
+                    grades=args.grades,
+                    dry_run=args.dry_run,
+                )
+                raw_price_results = price_checker(
+                    client,
+                    current_items,
+                    request_gap_seconds=request_gap_seconds,
+                    blocked_channels=blocked_price_channels,
+                    result_callback=stream_processor.handle,
+                )
+                # Custom checkers may return results without supporting the
+                # callback contract. Process any such result before state save.
+                for raw_result in raw_price_results:
+                    if (
+                        raw_result.session.key
+                        not in stream_processor.processed_session_keys
+                    ):
+                        stream_processor.handle(raw_result)
                 price_results = filter_price_level_results(
-                    check_all_price_levels(
-                        client,
-                        current_items,
-                        request_gap_seconds=request_gap_seconds,
-                        blocked_channels=blocked_price_channels,
-                    ),
+                    raw_price_results,
                     args.grades,
                 )
                 if STOP_REQUESTED.is_set():
                     log.info("👋 已停止")
                     return 0
-                round_rate_limits.extend(
-                    result for result in price_results if result.rate_limited
-                )
-                current_price_levels = display_price_level_results(
+                display_price_level_results(
                     price_results,
                     verbose=args.verbose,
                 )
-                update_price_level_streaks(
-                    price_level_streaks,
-                    price_results,
-                    confirmations=runtime.availability_confirmations,
-                    baselined_sessions=baselined_price_sessions,
+                pending_price_notification_keys = (
+                    stream_processor.pending_notification_keys
                 )
-                newly_price_levels: list[PriceLevelItem] = []
-                pending_confirmation = 0
-                for result in price_results:
-                    if result.error is not None:
-                        continue
-                    confirmed_items = confirmed_available_price_levels(
-                        result.items,
-                        price_level_streaks,
-                        confirmations=runtime.availability_confirmations,
-                    )
-                    newly_price_levels.extend(
-                        find_newly_available_price_levels(
-                            previous_price_levels,
-                            confirmed_items,
-                            initial_round=result.session.key
-                            not in baselined_price_sessions,
-                            notify_initial=runtime.notify_initial,
-                        )
-                    )
-                    if result.session.key in baselined_price_sessions:
-                        pending_confirmation += sum(
-                            item.available
-                            and previous_price_levels.get(item.key) is not True
-                            and 0
-                            < price_level_streaks.get(item.key, 0)
-                            < runtime.availability_confirmations
-                            for item in result.items
-                        )
-                if pending_confirmation:
+                if stream_processor.pending_confirmation:
                     log.info(
                         "🔎 检测到 %d 个候选可购票档，等待连续 %d 轮确认",
-                        pending_confirmation,
+                        stream_processor.pending_confirmation,
                         runtime.availability_confirmations,
                     )
-                eligible_price_levels = filter_notification_cooldown(
-                    newly_price_levels,
-                    last_notified_at,
-                    now=round_wall_time,
-                    cooldown=runtime.notification_cooldown,
-                )
-                suppressed = len(newly_price_levels) - len(eligible_price_levels)
-                if suppressed:
-                    log.info("🔕 %d 个票档仍在通知冷却期，已抑制重复提醒", suppressed)
-                if eligible_price_levels:
-                    log.info("🎉 连续确认 %d 个可购票档", len(eligible_price_levels))
-                    for item in eligible_price_levels:
-                        log.info(
-                            "   ↳ %s · %s · %s · %s · 当前最多可选 %d 张",
-                            item.target.channel_label,
-                            compact_session_name(item.session.session_name),
-                            item.seat_plan_name,
-                            format_price(item.original_price),
-                            item.can_buy_count,
-                        )
-                    delivered_keys: set[str] = set()
-                    if args.dry_run:
-                        log.info(
-                            "🧪 静默演练：本轮原本会发送 %d 个票档的合并通知",
-                            len(eligible_price_levels),
-                        )
-                        delivered_keys = {item.key for item in eligible_price_levels}
-                    elif dispatcher.configured:
-                        delivered_keys = notify_price_levels_available(
-                            dispatcher,
-                            eligible_price_levels,
-                        )
-                    else:
-                        log.warning("未配置通知渠道，未发送推送")
-                    delivered_items = [
-                        item
-                        for item in eligible_price_levels
-                        if item.key in delivered_keys
-                    ]
-                    if delivered_items:
-                        mark_notified(
-                            delivered_items,
-                            last_notified_at,
-                            now=round_wall_time,
-                        )
-                        state.alert_count += len(delivered_items)
-                    pending_price_notification_keys, exhausted_notification_keys = (
-                        record_notification_outcome(
-                            eligible_price_levels,
-                            delivered_keys,
-                            notification_retries,
-                            max_attempts=runtime.notification_max_retries,
-                        )
-                    )
-                    if pending_price_notification_keys:
-                        highest_attempt = max(
-                            notification_retries[key].attempts
-                            for key in pending_price_notification_keys
-                        )
-                        log.warning(
-                            "⚠️ %d 个票档推送全部失败，保留回流事件下轮重试（%d/%d）",
-                            len(pending_price_notification_keys),
-                            highest_attempt,
-                            runtime.notification_max_retries,
-                        )
-                    if exhausted_notification_keys:
-                        log.warning(
-                            "🛑 %d 个票档推送已连续失败 %d 次；停止本次事件重试，"
-                            "待其售罄后再次回流会重新提醒",
-                            len(exhausted_notification_keys),
-                            runtime.notification_max_retries,
-                        )
-                update_confirmed_price_level_state(
-                    previous_price_levels,
-                    price_results,
-                    price_level_streaks,
-                    confirmations=runtime.availability_confirmations,
-                    preserve_available_keys=pending_price_notification_keys,
-                )
-                baselined_price_sessions.update(
-                    result.session.key
-                    for result in price_results
-                    if result.error is None
-                )
                 all_prices_failed = bool(price_results) and all(
                     result.error is not None for result in price_results
                 )
