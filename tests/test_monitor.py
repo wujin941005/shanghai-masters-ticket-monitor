@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -699,6 +700,68 @@ class NotificationGuardTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, [pxq_session])
+
+    def test_restock_push_is_not_blocked_by_other_channel_context_lookup(self):
+        timeline = []
+        state = MonitorState.empty()
+        juss_session = InventoryItem(
+            TARGETS[0], "juss-night", "中央馆10月10日周六夜场", "ON_SALE"
+        )
+        pxq_session = InventoryItem(
+            TARGETS[5], "pxq-night", "中央馆10月10日周六夜场", "ON_SALE"
+        )
+        level = PriceLevelItem(juss_session, "p1", "B", 280, 1)
+        previous = {level.key: False}
+        streaks = {level.key: -1}
+        baselined = {juss_session.key}
+
+        class Dispatcher:
+            configured = True
+
+            def send(self, event):
+                timeline.append(event.title)
+                return {"test": True}
+
+        processor = StreamingPriceResultProcessor(
+            client=object(),
+            dispatcher=Dispatcher(),
+            state=state,
+            runtime=RuntimeOptions(notification_cooldown=0),
+            catalog_items=[juss_session, pxq_session],
+            previous_price_levels=previous,
+            price_level_streaks=streaks,
+            baselined_price_sessions=baselined,
+            last_notified_at={},
+            notification_retries={},
+            round_rate_limits=[],
+            round_started=0,
+            request_gap_seconds=0,
+            grades=None,
+            dry_run=False,
+        )
+
+        def fake_check_all(_client, _sessions, request_gap_seconds=0, blocked_channels=()):
+            return [
+                PriceLevelResult(
+                    pxq_session,
+                    [PriceLevelItem(pxq_session, "p2", "A", 340, 2)],
+                )
+            ]
+
+        primary_title = "🎾 久事体育 / 莓塔甄选 指定票档回流！"
+        with patch("monitor.check_all_price_levels", side_effect=fake_check_all):
+            processor.handle(PriceLevelResult(juss_session, [level]))
+
+        self.assertIn(primary_title, timeline)
+        for _ in range(40):
+            if "📌 同场次其他平台入口" in timeline:
+                break
+            time.sleep(0.05)
+        self.assertIn("📌 同场次其他平台入口", timeline)
+        self.assertLess(
+            timeline.index(primary_title),
+            timeline.index("📌 同场次其他平台入口"),
+        )
 
 
 class ParseSessionsTests(unittest.TestCase):

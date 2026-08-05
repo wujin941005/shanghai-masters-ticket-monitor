@@ -1843,43 +1843,14 @@ class StreamingPriceResultProcessor:
             )
             delivered_keys = {item.key for item in eligible}
         elif self.dispatcher.configured:
-            context_price_results = list(self.observed_results)
             context_sessions = select_other_channel_context_sessions(
                 eligible,
                 self.observed_results,
                 self.catalog_items,
             )
-            if context_sessions:
-                log.info(
-                    "🔗 为回流通知补查 %d 个同场次其他平台入口",
-                    len(context_sessions),
-                )
-                blocked_channels = {
-                    (
-                        result.target.channel
-                        if isinstance(result, TargetResult)
-                        else result.session.target.channel
-                    )
-                    for result in self.round_rate_limits
-                }
-                extra_context_results = filter_price_level_results(
-                    check_all_price_levels(
-                        self.client,
-                        context_sessions,
-                        request_gap_seconds=self.request_gap_seconds,
-                        blocked_channels=blocked_channels,
-                    ),
-                    self.grades,
-                )
-                self.round_rate_limits.extend(
-                    result
-                    for result in extra_context_results
-                    if result.rate_limited
-                )
-                context_price_results.extend(extra_context_results)
             other_channel_context = build_other_channel_context(
                 eligible,
-                context_price_results,
+                list(self.observed_results),
                 self.catalog_items,
             )
             delivered_keys = notify_price_levels_available(
@@ -1887,6 +1858,12 @@ class StreamingPriceResultProcessor:
                 eligible,
                 other_channel_context=other_channel_context,
             )
+            if context_sessions:
+                log.info(
+                    "🔗 同场次其他平台入口待补查 %d 个，推送后后台补充",
+                    len(context_sessions),
+                )
+                self._schedule_context_lookup(eligible, context_sessions)
         else:
             log.warning("未配置通知渠道，未发送推送")
 
@@ -1927,6 +1904,59 @@ class StreamingPriceResultProcessor:
                 self.runtime.notification_max_retries,
             )
         return pending_keys
+
+    def _schedule_context_lookup(
+        self,
+        eligible: list[PriceLevelItem],
+        context_sessions: Iterable[InventoryItem],
+    ) -> None:
+        """先推送回流通知，再后台补查同场次其他平台入口，不阻塞主链路。"""
+        thread = threading.Thread(
+            target=self._background_context_lookup,
+            args=(eligible, list(context_sessions)),
+            name="masters-context-lookup",
+            daemon=True,
+        )
+        thread.start()
+
+    def _background_context_lookup(
+        self,
+        eligible: list[PriceLevelItem],
+        context_sessions: list[InventoryItem],
+    ) -> None:
+        try:
+            extra_results = filter_price_level_results(
+                check_all_price_levels(
+                    self.client,
+                    context_sessions,
+                    request_gap_seconds=self.request_gap_seconds,
+                ),
+                self.grades,
+            )
+            context = build_other_channel_context(
+                eligible,
+                list(self.observed_results) + extra_results,
+                self.catalog_items,
+            )
+            lines: list[str] = []
+            for item in eligible:
+                key = (item.target.channel, session_comparison_key(item.session))
+                for message in context.get(key, ()):
+                    line = f"{compact_session_name(item.session.session_name)} · {message}"
+                    if line not in lines:
+                        lines.append(line)
+            if not lines:
+                return
+            self.dispatcher.send(
+                NotificationEvent(
+                    title="📌 同场次其他平台入口",
+                    body="\n".join(lines),
+                    url=eligible[0].target.buy_url,
+                )
+            )
+            log.info("✅ 后台补查同场次其他平台入口已补充推送")
+        except Exception as exc:
+            log.warning("后台补查同场次其他平台入口失败: %s", type(exc).__name__)
 
 
 def notify_error(dispatcher: NotificationDispatcher, error_count: int) -> None:
