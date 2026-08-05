@@ -190,11 +190,24 @@ PXQ_ALIPAY_APP_ID = "2021004123672725"
 PXQ_ALIPAY_PATH = "/pages/show-detail/show-detail"
 JUSS_CHANNEL_LABEL = "久事体育 / 莓塔甄选"
 JUSS_BUY_HINT = "点击打开久事体育对应活动页；莓塔甄选的大师赛入口也跳转久事"
+# 久事体育支付宝小程序 appId 与首页路径，来自官方分享口令解析。
+JUSS_ALIPAY_APP_ID = "2021003127624300"
+JUSS_ALIPAY_PATH = "/pages/Home/Home"
+JUSS_ALIPAY_BUY_HINT = "点击打开久事体育支付宝小程序，进入后选择大师赛购票入口；莓塔甄选大师赛入口同款"
 
 
 def build_juss_web_url(show_id: str) -> str:
     """久事当前没有下发可复用深链，使用可访问的精确官方活动页。"""
     return f"{JUSS_BASE}/content/{show_id}?{urlencode({'showId': show_id})}"
+
+
+def build_juss_alipay_url(_show_id: str = "") -> str:
+    """久事体育支付宝小程序首页入口，用户在小程序内自行进入购票页。"""
+    scheme = (
+        f"alipays://platformapi/startapp?appId={JUSS_ALIPAY_APP_ID}"
+        f"&page={JUSS_ALIPAY_PATH}"
+    )
+    return f"https://ds.alipay.com/?{urlencode({'scheme': scheme})}"
 
 
 def build_piaoxingqiu_alipay_url(show_id: str) -> str:
@@ -305,8 +318,12 @@ def build_targets(buy_url_mode: str = "alipay") -> tuple[EventTarget, ...]:
     targets: list[EventTarget] = []
     for channel, channel_label, base_url, show_id, show_label, date_hint in target_specs:
         if channel == "juss":
-            buy_url = build_juss_web_url(show_id)
-            buy_hint = JUSS_BUY_HINT
+            if mode == "alipay":
+                buy_url = build_juss_alipay_url(show_id)
+                buy_hint = JUSS_ALIPAY_BUY_HINT
+            else:
+                buy_url = build_juss_web_url(show_id)
+                buy_hint = JUSS_BUY_HINT
         else:
             buy_url = {
                 "alipay": build_piaoxingqiu_alipay_url,

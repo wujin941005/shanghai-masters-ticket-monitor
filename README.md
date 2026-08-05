@@ -30,7 +30,7 @@ uv run monitor.py --list-sessions --channels juss --match ''
 
 票档级查询会读取平台公开返回的票档名称、票面价和动态可选张数。首轮只建立当前库存基线；之后仅在某个票档从不可购变为可购时推送，不会因为库存状态没变而反复提醒。
 
-通知点击入口只使用已核验的平台链接：久事 / 莓塔打开产生回流票的对应久事官方活动页；票星球默认通过 `ds.alipay.com` 打开对应活动的支付宝小程序。票星球也可设置 `BUY_URL_MODE=app` 使用官方原生 App Scheme，或设置为 `web` 使用对应活动网页。旧配置名 `BARK_BUY_URL_MODE` 仍兼容。
+通知点击入口只使用已核验的平台链接：久事 / 莓塔默认通过 `ds.alipay.com` 打开**久事体育支付宝小程序**首页（用户在小程序内进入购票入口）；票星球默认通过 `ds.alipay.com` 打开对应活动的支付宝小程序。设置 `BUY_URL_MODE=web` 时，久事 / 莓塔改回对应的久事官方活动页、票星球改回活动网页；`BUY_URL_MODE=app` 时票星球使用官方原生 App Scheme。旧配置名 `BARK_BUY_URL_MODE` 仍兼容。
 
 Bark 点击系统通知会直接尝试打开购票入口。WxPusher 的 `url` 字段作为原文
 链接发送，同时在 Markdown 正文末尾显示“立即打开官方购票入口”；即使某个
@@ -96,7 +96,7 @@ BARK_KEY=https://api.day.app/your_key_here
 MONITOR_INTERVAL=15
 MATCH=10月17日,10月18日
 # BUY_URL_MODE=app  # 可选：票星球原生 App；默认 alipay
-# BUY_URL_MODE=web  # 可选：两个平台都使用普通网页
+# BUY_URL_MODE=web  # 可选：久事/莓塔回网页，票星球用活动网页
 # GRADES=S,A+,A,B
 ```
 

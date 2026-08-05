@@ -8,6 +8,8 @@ from monitor import (
     AVAILABLE_STATUSES,
     HttpClient,
     InventoryItem,
+    JUSS_ALIPAY_APP_ID,
+    JUSS_ALIPAY_PATH,
     MonitorState,
     PXQ_ALIPAY_APP_ID,
     PXQ_ALIPAY_PATH,
@@ -20,6 +22,7 @@ from monitor import (
     TARGETS,
     TargetResult,
     build_http_client,
+    build_juss_alipay_url,
     build_other_channel_context,
     build_juss_web_url,
     build_parser,
@@ -997,8 +1000,20 @@ class SelectionTests(unittest.TestCase):
             all(not target.buy_url.startswith("weixin://") for target in TARGETS)
         )
 
-    def test_juss_targets_use_precise_official_event_pages(self):
+    def test_juss_targets_default_to_alipay_mini_program(self):
         targets = build_targets()[:5]
+
+        for target in targets:
+            outer_query = parse_qs(urlsplit(target.buy_url).query)
+            scheme = outer_query["scheme"][0]
+            scheme_query = parse_qs(urlsplit(scheme).query)
+            self.assertEqual(urlsplit(target.buy_url).netloc, "ds.alipay.com")
+            self.assertEqual(urlsplit(scheme).scheme, "alipays")
+            self.assertEqual(scheme_query["appId"], [JUSS_ALIPAY_APP_ID])
+            self.assertEqual(scheme_query["page"], [JUSS_ALIPAY_PATH])
+
+    def test_juss_web_mode_keeps_precise_official_event_pages(self):
+        targets = build_targets("web")[:5]
 
         for target in targets:
             self.assertEqual(target.buy_url, build_juss_web_url(target.show_id))
